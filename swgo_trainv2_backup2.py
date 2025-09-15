@@ -12,10 +12,10 @@ import os
 from datetime import datetime
 import argparse
 from lion_opt import Lion
-from torch.nn import MultiheadAttention
 
 
-from conditional_flow_matching import TargetConditionalFlowMatcher
+from conditional_flow_matching import TargetConditionalFlowMatcher, ReverseConditionalFlowMatcher
+from custom_scheduler import CosineAnnealingWarmupRestarts
 from modules import TimestepEmbedder, ResNetBlock
 
 from dpm import DPM_Solver, NoiseScheduleFlow
@@ -49,40 +49,27 @@ class CFMDiagramModel(nn.Module):
     data_dim: number of target features (x0, y0, E, theta, phi) -> 5
     cond_feature_dim: number of conditioned features (x, y, N, T) -> 4
     """
-    def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128,
-                 num_res_blocks=3, dropout=0.1, num_detectors=90):
+    def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128, num_res_blocks=3, dropout=0.1):
         super().__init__()
 
-        self.num_detectors = num_detectors
-        self.model_dim = model_dim
-
-        from modules import TimestepEmbedder, ResNetBlock
         self.time_embedder = TimestepEmbedder(model_dim)
 
-        def two_layer_mlp(in_dim, out_dim, p=0.1):
-            h1, h2 = 256, 256
+        def two_layer_mlp(in_dim, out_dim, hidden_dim=None, p=0.1):
+            h = hidden_dim or out_dim
             return nn.Sequential(
-                nn.Linear(in_dim, h1), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h1, h2), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h2, out_dim), nn.Dropout(p),
+                nn.Linear(in_dim, h),
+                nn.SiLU(),
+                nn.Dropout(p),
+                nn.Linear(h, out_dim),
+                nn.Dropout(p),
             )
 
         # Encoders
         self.cond_mlp         = two_layer_mlp(cond_feature_dim, model_dim, p=dropout)
         self.noisy_target_mlp = two_layer_mlp(data_dim,          model_dim, p=dropout)
 
-        # Conditioning signal 'C' (concat time + flattened cond)
-        cond_hidden_dim = model_dim
-        conditioning_input_dim = (num_detectors * cond_hidden_dim) + model_dim
-        self.conditioning_C = two_layer_mlp(conditioning_input_dim, model_dim, p=dropout)
-
-        # Cross-attention
-        self.cross_attn = MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True,
-        )
+        # Conditioning signal 'C' (concat time + pooled cond)
+        self.conditioning_C = two_layer_mlp(model_dim * 2, model_dim, p=dropout)
 
         # adaLN-zero
         self.adaLN_generator = nn.Linear(model_dim, model_dim * 2)
@@ -90,121 +77,103 @@ class CFMDiagramModel(nn.Module):
         nn.init.zeros_(self.adaLN_generator.weight)
         nn.init.zeros_(self.adaLN_generator.bias)
 
-        self.resnet_blocks = nn.ModuleList(
-            [ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)]
-        )
+        # Residual stack
+        self.resnet_blocks = nn.ModuleList([ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)])
 
+        # Final projection
         self.final_mlp = nn.Sequential(
-            nn.Linear(model_dim, model_dim * 4), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(model_dim * 4, model_dim), nn.Dropout(dropout),
+            nn.Linear(model_dim, model_dim * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.Dropout(dropout),
         )
         self.output_layer = nn.Linear(model_dim, data_dim)
+
 
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor, t: torch.Tensor):
         # Time embedding
         time_emb = self.time_embedder(t)
 
-        # Condition features
-        cond_emb = self.cond_mlp(cond)   # (B, M, D) if detectors present
+        # Condition features: support (B, 4) or (B, M, 4) for detector-level cond=(x,y,N,T)
+        cond_emb = self.cond_mlp(cond)
         if cond_emb.dim() == 3:
-            pooled_cond = cond_emb.reshape(cond_emb.size(0), -1)  # flatten detectors
+            # (B, M, H) -> pool across detectors
+            pooled_cond = cond_emb.mean(dim=1)
         elif cond_emb.dim() == 2:
+            # (B, H) -> already pooled / single detector vector
             pooled_cond = cond_emb
         else:
             raise ValueError(f"Unexpected cond_emb shape {cond_emb.shape}")
 
-        # === Global concatenation context ===
+        # Concatenate for context 'C'
         combined = torch.cat([time_emb, pooled_cond], dim=-1)
         c = self.conditioning_C(combined)
 
         # Noisy target features
         h = self.noisy_target_mlp(x_t)
 
-        # === Cross-attention ===
-        query = h.unsqueeze(1)  # (B, 1, D)
-        if cond_emb.dim() == 3:
-            key_value = cond_emb   # (B, M, D)
-        else:
-            key_value = c.unsqueeze(1)  # fallback
-
-        attn_output, _ = self.cross_attn(query, key_value, key_value)
-        h = h + attn_output.squeeze(1)  # residual connection
-
-        # === AdaLN conditioning ===
+        # adaLN-zero
         adaLN_params = self.adaLN_generator(c)
         scale, shift = adaLN_params.chunk(2, dim=-1)
         h = self.layer_norm(h) * (1 + scale) + shift
 
+        # Residual blocks
         for block in self.resnet_blocks:
             h = block(h)
 
+        # Final MLP
         h = self.final_mlp(h)
         v_pred = self.output_layer(h)
         return v_pred
 
-
-
 class SWGODataModule(pl.LightningDataModule):
     """
-    Loads directly from .h5, applies normalization, and builds datasets.
+    Expects two files:
+      inputs.pt -> Tensor of all inputs
+      labels.pt -> Tensor of all labels
+    Splits into train/val/test on the fly.
     """
-    def __init__(self, h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
-                 batch_size=256, val_split=0.1, seed=42):
+    def __init__(self, inputs_path="inputs.pt", labels_path="labels.pt",
+                 batch_size=256, val_split=0.1, test_split=0.1, seed=42):
         super().__init__()
-        self.h5_path = h5_path
+        self.inputs_path = inputs_path
+        self.labels_path = labels_path
         self.batch_size = batch_size
         self.val_split = val_split
+        self.test_split = test_split
         self.seed = seed
         self.num_workers = 10
 
-    def _zscore(self, data: np.ndarray, name: str):
-        mean = data.mean()
-        std = data.std()
-        if std == 0:
-            std = 0.1 if name in ["phi"] else 1.0
-        return (data - mean) / std
+    def prepare_data(self):
+        pass  # nothing to do here
 
     def setup(self, stage=None):
-        import h5py, numpy as np, torch
+        try:
+            rank_zero_info("Loading dataset from inputs.pt and labels.pt...")
+            inputs = torch.load(self.inputs_path)
+            labels = torch.load(self.labels_path)
 
-        # Load from .h5
-        with h5py.File(self.h5_path, "r") as f:
-            inputs = f["inputs"][:]   # (events, nunits, 4)
-            labels = f["labels"][:]   # (events, 5)
+            full_dataset = TensorDataset(inputs, labels)
 
-        # Normalize inputs
-        inputs_norm = np.zeros_like(inputs)
-        names_inputs = ["x", "y", "N", "T"]
-        for i, name in enumerate(names_inputs):
-            arr = inputs[:, :, i]
-            if name in ["E", "N"]:  # log-transform for E & N
-                arr = np.log(arr + 1e-8)
-            inputs_norm[:, :, i] = self._zscore(arr, name)
+            # Compute split sizes
+            n_total = len(full_dataset)
+            n_val = int(self.val_split * n_total)
+            n_test = int(self.test_split * n_total)
+            n_train = n_total - n_val - n_test
 
-        # Normalize labels
-        labels_norm = np.zeros_like(labels)
-        names_labels = ["x0", "y0", "E", "theta", "phi"]
-        for i, name in enumerate(names_labels):
-            arr = labels[:, i]
-            if name in ["E", "N"]:
-                arr = np.log(arr + 1e-8)
-            labels_norm[:, i] = self._zscore(arr, name)
+            self.train_dataset, self.val_dataset, self.test_dataset = random_split(
+                full_dataset, [n_train, n_val, n_test],
+                generator=torch.Generator().manual_seed(self.seed)
+            )
 
-        # Convert to tensors
-        inputs_tensor = torch.tensor(inputs_norm, dtype=torch.float32)
-        labels_tensor = torch.tensor(labels_norm, dtype=torch.float32)
-
-        # Build dataset
-        full_dataset = TensorDataset(inputs_tensor, labels_tensor)
-        n_total = len(full_dataset)
-        n_val = int(self.val_split * n_total)
-        n_train = n_total - n_val 
-
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(self.seed)
-        )
-        rank_zero_info(f"Data loaded: {n_train} train, {n_val} val")
+            rank_zero_info(f"Data loaded: {n_train} train, {n_val} val, {n_test} test samples")
+        except FileNotFoundError as e:
+            rank_zero_info(f"Error: {e}. Please ensure '{self.inputs_path}' and '{self.labels_path}' exist.")
+            exit()
+        except ValueError:
+            rank_zero_info("Error loading data. Ensure .pt files contain tensors.")
+            exit()
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size,
@@ -214,7 +183,9 @@ class SWGODataModule(pl.LightningDataModule):
         return DataLoader(self.val_dataset, batch_size=self.batch_size * 2,
                           num_workers=self.num_workers, pin_memory=True)
 
-
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size * 2,
+                          num_workers=self.num_workers, pin_memory=True)
 
 
 class CFMLightningModule(pl.LightningModule):
@@ -326,11 +297,10 @@ class CFMLightningModule(pl.LightningModule):
         else:
             loss = self.criterion(v_pred, ut)
 
-        # === Add: prediction sampling and set2set validation loss ===
-        cond, x1 = batch                     # x1 is the true target (x0,y0,E,theta,phi) 5-D. :contentReference[oaicite:6]{index=6}
+        cond, x1 = batch                     
         x1 = x1.view(x1.size(0), -1).to(self.device)
+        cond = cond.to(self.device)
 
-        # sample a predicted target using your existing DPM pipeline (same as predict_step)  :contentReference[oaicite:7]{index=7}
         x0 = torch.randn(cond.size(0), 5, device=self.device)
         pred = self.dpm.sample(
             x0,
@@ -354,16 +324,18 @@ class CFMLightningModule(pl.LightningModule):
         return {"val_loss": loss, "val_pred_loss": pred_loss}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        cond, _ = batch  # We only need the condition from the batch
+        cond, _ = batch  
+        cond = cond.to(self.device)   # <<< FIX: move to GPU
         x0 = torch.randn(cond.size(0), 5, device=self.device)
         samples = self.dpm.sample(
             x0,
             truth=cond,
             mask=None,
             global_data=None,
-            steps=25,
+            steps=50,
             method="multistep",
             skip_type="time_uniform_flow",
+            show_progress=False,
         )
         return samples
 
@@ -433,6 +405,109 @@ class LossTracker(pl.Callback):
         if 'val_loss' in trainer.logged_metrics:
             self.val_losses.append(trainer.logged_metrics['val_loss'].item())
 
+# ============================================================
+# === Analysis utilities (denormalization, plotting, eval) ===
+# ============================================================
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+THETA_MAX = torch.pi / 2  # Max theta in radians
+
+
+def denormalize_labels(norm_params: torch.Tensor, theta_max: float) -> torch.Tensor:
+    x0_norm, y0_norm, e_norm, th_norm, ph_norm = norm_params.T
+    x0 = x0_norm * 5000
+    y0 = y0_norm * 5000
+    e = 0.1 + (e_norm + 1) * (10 - 0.1) / 2
+    theta = (th_norm + 1) * theta_max / 2
+    phi = ph_norm * torch.pi
+    return torch.stack([x0, y0, e, theta, phi], dim=1)
+
+
+def plot_parameter_comparison(true_vals, pred_vals, label, output_path, xlim=None):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+    fig.suptitle(f'Parameter Comparison for {label}', fontsize=18)
+
+    # Histogram
+    ax1.hist(true_vals, bins=60, label='True', density=True, histtype='step', linewidth=2)
+    ax1.hist(pred_vals, bins=60, label='Predicted', density=True, histtype='step', linewidth=2)
+    ax1.set_title('Distribution Comparison', fontsize=14)
+    ax1.set_xlabel(label, fontsize=12)
+    ax1.set_ylabel('Density', fontsize=12)
+    ax1.legend()
+    ax1.grid(True, linestyle='--')
+    if xlim:
+        ax1.set_xlim(xlim)
+
+    # 2D Histogram
+    plot_subset = min(10000, len(true_vals))
+    indices = np.random.choice(len(true_vals), plot_subset, replace=False)
+    hb = ax2.hist2d(true_vals[indices], pred_vals[indices], bins=50, cmap='viridis', cmin=1)
+    ax2.set_title('Predicted vs. True Values', fontsize=14)
+    ax2.set_xlabel(f'True {label}', fontsize=12)
+    ax2.set_ylabel(f'Predicted {label}', fontsize=12)
+    fig.colorbar(hb[3], ax=ax2, label='Count')
+
+    lims = [np.min([ax2.get_xlim(), ax2.get_ylim()]),
+            np.max([ax2.get_xlim(), ax2.get_ylim()])]
+    ax2.plot(lims, lims, 'r--', alpha=0.8, label='Ideal (y=x)')
+    ax2.set_xlim(lims)
+    ax2.set_ylim(lims)
+    ax2.set_aspect('equal', adjustable='box')
+    if xlim:
+        ax2.set_xlim(xlim)
+        ax2.set_ylim(xlim)
+    ax2.legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def run_analysis(ckpt_path, data_module, output_dir="analysis_plots"):
+    print("🚀 Starting analysis script...")
+    os.makedirs(output_dir, exist_ok=True)
+
+    test_loader = data_module.test_dataloader()
+    test_labels = torch.cat([batch[1] for batch in test_loader], dim=0)
+
+    # Load model
+    print(f"\nLoading model from checkpoint: '{ckpt_path}'")
+    model = CFMLightningModule.load_from_checkpoint(ckpt_path)
+    model.eval()
+
+    # Run predictions
+    preds = []
+    with torch.no_grad():
+        for batch in test_loader:
+            pred = model.predict_step(batch, 0)
+            preds.append(pred.cpu())
+    pred_params_norm = torch.cat(preds, dim=0)
+
+    # Denormalize
+    print("Denormalizing parameters...")
+    true_params_denorm = denormalize_labels(test_labels, THETA_MAX).numpy()
+    pred_params_denorm = denormalize_labels(pred_params_norm, THETA_MAX).numpy()
+
+    # Generate plots
+    param_info = [
+        {'label': 'x0 (m)', 'name': 'x0'},
+        {'label': 'y0 (m)', 'name': 'y0'},
+        {'label': 'Energy (TeV)', 'name': 'energy'},
+        {'label': 'Theta (rad)', 'name': 'theta'},
+        {'label': 'Phi (rad)', 'name': 'phi'}
+    ]
+    for i, info in enumerate(param_info):
+        xlim = (0, 2.5) if info['name'] == 'energy' else None
+        plot_parameter_comparison(
+            true_vals=true_params_denorm[:, i],
+            pred_vals=pred_params_denorm[:, i],
+            label=info['label'],
+            output_path=os.path.join(output_dir, f"{info['name']}_comparison.png"),
+            xlim=xlim
+        )
+    print(f"\n✅ All parameter comparison plots saved in '{output_dir}'")
 
 
 if __name__ == "__main__":
@@ -448,24 +523,20 @@ if __name__ == "__main__":
 
     parser.add_argument("--use_comet", action="store_true", help="Enable Comet.ml logging.")
     parser.add_argument("--run_name", type=str, default="", help="Optional custom name for the output folder.")
-
-
     parser.add_argument("--input_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_inputs.pt", help="Path to the training dataset (.pt file).")
     parser.add_argument("--label_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_labels.pt", help="Path to the validation dataset (.pt file).")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training.")
-
-
     parser.add_argument("--flow_matcher", type=str, default="target", choices=["target", "reverse"], help="Which Conditional Flow Matcher to use.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate used across MLPs and residual blocks.")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["lion", "adamw"], help="Optimizer to use.")
     parser.add_argument("--loss_function", type=str, default="mse", choices=["mse", "mseanddirection", "component_mse"], help="Loss function to use for training.")
     parser.add_argument("--time_pow", action="store_true",
                         help="Use power-law time sampling (t ~ Power(3)), inspired by fs_npf_lightning.")
+    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
+                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
     parser.add_argument("--use_scheduler", action="store_true", help="Enable the learning rate scheduler.")
     parser.add_argument("--gpus", type=str, default="0", help="Comma-separated list of GPU IDs to use (e.g., '0,1,2,3').")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train for.")
-    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
-                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
     parser.add_argument("--gradient_clip_val", type=float, default=0.0, help="Value for gradient clipping. 0 means no clipping.")
     parser.add_argument("--use_swa", action="store_true", help="Enable Stochastic Weight Averaging.")
 
@@ -478,20 +549,28 @@ if __name__ == "__main__":
 
     # Create dynamic output directory
     base_script_name = os.path.splitext(os.path.basename(__file__))[0]
+
+
+    # Ensure all ranks share the same timestamp
+    if is_main_process:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.environ["RUN_TIMESTAMP"] = timestamp
+    else:
+        timestamp = os.environ["RUN_TIMESTAMP"]
+
+    # Build output_dir (use run_name if given, else fallback)
     if args.run_name:
         output_dir = f"{args.run_name}_{timestamp}"
     else:
         output_dir = f"{base_script_name}_run_results_{timestamp}"
+
     log_dir = os.path.join(output_dir, "slurm_logs")
-    
-    if is_main_process:
-        os.makedirs(log_dir, exist_ok=True)
 
 
     # --- Hyperparameters ---
     EPOCHS      = args.epochs
     LEARNING_RATE = 3e-5
-    NUM_RES_BLOCKS = 6
+    NUM_RES_BLOCKS = 4
 
     # --- Comet.ml Logger ---
     logger = None
@@ -516,10 +595,12 @@ if __name__ == "__main__":
 
                                  
     data_module = SWGODataModule(
-        h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
+        inputs_path= args.input_data_path,
+        labels_path= args.label_data_path,
         batch_size=args.batch_size,
         val_split=0.1,
-    )
+        test_split=0.1
+    )                                
 
     model_module = CFMLightningModule(
         learning_rate=LEARNING_RATE,
@@ -539,6 +620,7 @@ if __name__ == "__main__":
     callbacks = [
         TQDMProgressBar(refresh_rate=10),
         loss_tracker,
+        EarlyStopping(monitor="val_loss", mode="min", patience=25, verbose=is_main_process)
     ]
 
     if args.use_swa:
@@ -549,10 +631,11 @@ if __name__ == "__main__":
     if args.save_ckpt:
         # Note: 'train_loss_epoch' is available because self.log in training_step has on_epoch=True
         checkpoint_callback = ModelCheckpoint(
-            dirpath=os.path.join(output_dir, "ckpts"),
-            filename='{epoch:03d}',
-            save_top_k=-1,     # keep all checkpoints
-            every_n_epochs=1,  # save every epoch
+            dirpath=output_dir,
+            filename='{epoch:03d}-{val_loss:.4f}-{train_loss_epoch:.4f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=3,
             verbose=is_main_process
         )
         callbacks.append(checkpoint_callback)
@@ -610,6 +693,26 @@ if __name__ == "__main__":
     if is_main_process:
         print("Training finished.")
 
+    analysis_dir = os.path.join(output_dir, "analysis_plots")
 
+    ckpt_path = None
+    for cb in trainer.callbacks:
+        if isinstance(cb, ModelCheckpoint):
+            ckpt_path = cb.best_model_path
+            print("Best model ckpt: ", ckpt_path)
+            break
+
+    if not ckpt_path:
+        print(f"WARNING: No best checkpoint found in {output_dir}")
+
+    if is_main_process and ckpt_path and os.path.exists(ckpt_path):
+        run_analysis(
+            ckpt_path=ckpt_path,
+            data_module=data_module,
+            output_dir=analysis_dir,
+        )
+    else:
+        if is_main_process:
+            print("⚠️ No checkpoint found, skipping analysis.")
     if is_main_process:
         print("Job finished.")

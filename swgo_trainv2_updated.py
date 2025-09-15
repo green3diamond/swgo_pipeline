@@ -12,77 +12,81 @@ import os
 from datetime import datetime
 import argparse
 from lion_opt import Lion
-from torch.nn import MultiheadAttention
-
-
 from conditional_flow_matching import TargetConditionalFlowMatcher
+from custom_scheduler import CosineAnnealingWarmupRestarts
 from modules import TimestepEmbedder, ResNetBlock
 
 from dpm import DPM_Solver, NoiseScheduleFlow
 from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from modules import SWGODataModule
 
-from set2setloss import Set2SetLoss
+def normalize_std(x, name=""):
+    mean = x.mean()
+    if x.numel() < 2:
+        std = torch.tensor(0.1).float() if name in ["eta", "phi"] else torch.tensor(1.0).float()
+    else:
+        std = x.std()
+        if std == 0:
+            std = torch.tensor(0.1).float() if name in ["eta", "phi"] else torch.tensor(1.0).float()
+    return (x - mean) / std, mean, std
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class MSEAndDirectionLoss(torch.nn.Module):
-    """
-    Figure 7 - https://arxiv.org/abs/2410.10356
-    """
 
-    def __init__(self, cosine_sim_dim: int = 1):  # fix default to 1
-        super().__init__()
-        self.cosine_sim_dim = cosine_sim_dim
+inputs_path = "/n/home04/hhanif/swgo_input_files/mini_inputs.pt"
+labels_path = "/n/home04/hhanif/swgo_input_files/mini_labels.pt"
 
-    def forward(self, pred, target, **kwargs):
-        mse_loss = torch.nn.functional.mse_loss(pred, target, reduction="sum")
-        direction_loss = (
-            1.0 - torch.nn.functional.cosine_similarity(pred, target, dim=self.cosine_sim_dim)
-        ).sum()
-        return mse_loss + direction_loss
+inputs = torch.load(inputs_path).to(device)
+labels = torch.load(labels_path).to(device)
+
+Nevents, Nunits, Features = inputs.shape
+inputs_flat = inputs.reshape(Nevents, Nunits * Features)
+
+x_tensor_norm, x_mean, x_std = normalize_std(labels, name="x")
+c_tensor_norm, c_mean, c_std = normalize_std(inputs_flat, name="cond")
+
+dataset = TensorDataset(c_tensor_norm, x_tensor_norm)
+train_size = int(0.8 * len(dataset))
+val_size = int(0.1 * len(dataset))
+test_size = len(dataset) - train_size - val_size
+train_set, val_set, test_set = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
+
+train_loader = DataLoader(train_set, batch_size=512, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=512)
+test_loader = DataLoader(test_set, batch_size=512)
 
 
+x_dim = x_tensor_norm.shape[-1]
+c_dim = c_tensor_norm.shape[-1]
 
 class CFMDiagramModel(nn.Module):
     """
     data_dim: number of target features (x0, y0, E, theta, phi) -> 5
     cond_feature_dim: number of conditioned features (x, y, N, T) -> 4
     """
-    def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128,
-                 num_res_blocks=3, dropout=0.1, num_detectors=90):
+    def __init__(self, data_dim=x_dim, cond_feature_dim=c_dim, model_dim=128, num_res_blocks=3, dropout=0.1):
         super().__init__()
 
-        self.num_detectors = num_detectors
-        self.model_dim = model_dim
-
-        from modules import TimestepEmbedder, ResNetBlock
         self.time_embedder = TimestepEmbedder(model_dim)
 
-        def two_layer_mlp(in_dim, out_dim, p=0.1):
-            h1, h2 = 256, 256
+        def two_layer_mlp(in_dim, out_dim, hidden_dim=None, p=0.1):
+            h = hidden_dim or out_dim
             return nn.Sequential(
-                nn.Linear(in_dim, h1), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h1, h2), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h2, out_dim), nn.Dropout(p),
+                nn.Linear(in_dim, h),
+                nn.SiLU(),
+                nn.Dropout(p),
+                nn.Linear(h, out_dim),
+                nn.Dropout(p),
             )
 
         # Encoders
         self.cond_mlp         = two_layer_mlp(cond_feature_dim, model_dim, p=dropout)
         self.noisy_target_mlp = two_layer_mlp(data_dim,          model_dim, p=dropout)
 
-        # Conditioning signal 'C' (concat time + flattened cond)
-        cond_hidden_dim = model_dim
-        conditioning_input_dim = (num_detectors * cond_hidden_dim) + model_dim
-        self.conditioning_C = two_layer_mlp(conditioning_input_dim, model_dim, p=dropout)
-
-        # Cross-attention
-        self.cross_attn = MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True,
-        )
+        # Conditioning signal 'C' (concat time + pooled cond)
+        self.conditioning_C = two_layer_mlp(model_dim * 2, model_dim, p=dropout)
 
         # adaLN-zero
         self.adaLN_generator = nn.Linear(model_dim, model_dim * 2)
@@ -90,132 +94,46 @@ class CFMDiagramModel(nn.Module):
         nn.init.zeros_(self.adaLN_generator.weight)
         nn.init.zeros_(self.adaLN_generator.bias)
 
-        self.resnet_blocks = nn.ModuleList(
-            [ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)]
-        )
+        # Residual stack
+        self.resnet_blocks = nn.ModuleList([ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)])
 
+        # Final projection
         self.final_mlp = nn.Sequential(
-            nn.Linear(model_dim, model_dim * 4), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(model_dim * 4, model_dim), nn.Dropout(dropout),
+            nn.Linear(model_dim, model_dim * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.Dropout(dropout),
         )
         self.output_layer = nn.Linear(model_dim, data_dim)
+
 
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor, t: torch.Tensor):
         # Time embedding
         time_emb = self.time_embedder(t)
 
-        # Condition features
-        cond_emb = self.cond_mlp(cond)   # (B, M, D) if detectors present
-        if cond_emb.dim() == 3:
-            pooled_cond = cond_emb.reshape(cond_emb.size(0), -1)  # flatten detectors
-        elif cond_emb.dim() == 2:
-            pooled_cond = cond_emb
-        else:
-            raise ValueError(f"Unexpected cond_emb shape {cond_emb.shape}")
-
-        # === Global concatenation context ===
+        cond_emb = self.cond_mlp(cond)
+        pooled_cond = cond_emb
+    # Concatenate for context 'C'
         combined = torch.cat([time_emb, pooled_cond], dim=-1)
         c = self.conditioning_C(combined)
 
         # Noisy target features
         h = self.noisy_target_mlp(x_t)
 
-        # === Cross-attention ===
-        query = h.unsqueeze(1)  # (B, 1, D)
-        if cond_emb.dim() == 3:
-            key_value = cond_emb   # (B, M, D)
-        else:
-            key_value = c.unsqueeze(1)  # fallback
-
-        attn_output, _ = self.cross_attn(query, key_value, key_value)
-        h = h + attn_output.squeeze(1)  # residual connection
-
-        # === AdaLN conditioning ===
+        # adaLN-zero
         adaLN_params = self.adaLN_generator(c)
         scale, shift = adaLN_params.chunk(2, dim=-1)
         h = self.layer_norm(h) * (1 + scale) + shift
 
+        # Residual blocks
         for block in self.resnet_blocks:
             h = block(h)
 
+        # Final MLP
         h = self.final_mlp(h)
         v_pred = self.output_layer(h)
         return v_pred
-
-
-
-class SWGODataModule(pl.LightningDataModule):
-    """
-    Loads directly from .h5, applies normalization, and builds datasets.
-    """
-    def __init__(self, h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
-                 batch_size=256, val_split=0.1, seed=42):
-        super().__init__()
-        self.h5_path = h5_path
-        self.batch_size = batch_size
-        self.val_split = val_split
-        self.seed = seed
-        self.num_workers = 10
-
-    def _zscore(self, data: np.ndarray, name: str):
-        mean = data.mean()
-        std = data.std()
-        if std == 0:
-            std = 0.1 if name in ["phi"] else 1.0
-        return (data - mean) / std
-
-    def setup(self, stage=None):
-        import h5py, numpy as np, torch
-
-        # Load from .h5
-        with h5py.File(self.h5_path, "r") as f:
-            inputs = f["inputs"][:]   # (events, nunits, 4)
-            labels = f["labels"][:]   # (events, 5)
-
-        # Normalize inputs
-        inputs_norm = np.zeros_like(inputs)
-        names_inputs = ["x", "y", "N", "T"]
-        for i, name in enumerate(names_inputs):
-            arr = inputs[:, :, i]
-            if name in ["E", "N"]:  # log-transform for E & N
-                arr = np.log(arr + 1e-8)
-            inputs_norm[:, :, i] = self._zscore(arr, name)
-
-        # Normalize labels
-        labels_norm = np.zeros_like(labels)
-        names_labels = ["x0", "y0", "E", "theta", "phi"]
-        for i, name in enumerate(names_labels):
-            arr = labels[:, i]
-            if name in ["E", "N"]:
-                arr = np.log(arr + 1e-8)
-            labels_norm[:, i] = self._zscore(arr, name)
-
-        # Convert to tensors
-        inputs_tensor = torch.tensor(inputs_norm, dtype=torch.float32)
-        labels_tensor = torch.tensor(labels_norm, dtype=torch.float32)
-
-        # Build dataset
-        full_dataset = TensorDataset(inputs_tensor, labels_tensor)
-        n_total = len(full_dataset)
-        n_val = int(self.val_split * n_total)
-        n_train = n_total - n_val 
-
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(self.seed)
-        )
-        rank_zero_info(f"Data loaded: {n_train} train, {n_val} val")
-
-    def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size,
-                          shuffle=True, num_workers=self.num_workers, pin_memory=True)
-
-    def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size * 2,
-                          num_workers=self.num_workers, pin_memory=True)
-
-
-
 
 class CFMLightningModule(pl.LightningModule):
     def __init__(self, learning_rate=3e-5, num_res_blocks=3, flow_matcher_type="target",
@@ -225,33 +143,12 @@ class CFMLightningModule(pl.LightningModule):
         self.model = CFMDiagramModel(num_res_blocks=num_res_blocks, dropout=dropout)
 
         # Initialize the chosen flow matcher
-        if self.hparams.flow_matcher_type == "target":
-            self.flow_matcher = TargetConditionalFlowMatcher(sigma=1e-6)
-            rank_zero_info("Using TargetConditionalFlowMatcher.")
-        elif self.hparams.flow_matcher_type == "reverse":
-            self.flow_matcher = ReverseConditionalFlowMatcher(sigma=1e-6)
-            rank_zero_info("Using ReverseConditionalFlowMatcher.")
-        else:
-            raise ValueError(f"Unknown flow_matcher_type: {self.hparams.flow_matcher_type}")
+        self.flow_matcher = TargetConditionalFlowMatcher(sigma=1e-6)
+        rank_zero_info("Using TargetConditionalFlowMatcher.")
 
-        # Initialize the chosen loss function
-        if self.hparams.loss_function == "mse":
-            self.criterion = nn.MSELoss()
-            rank_zero_info("Using Mean Squared Error (MSE) loss.")
-        elif self.hparams.loss_function == "mseanddirection":
-            self.criterion = MSEAndDirectionLoss()
-        elif self.hparams.loss_function == "component_mse":
-            self.criterion = None
-            if self.hparams.component_weights is None:
-                self.register_buffer("comp_w", torch.ones(5) / 5.0)
-            else:
-                cw = torch.tensor(self.hparams.component_weights, dtype=torch.float32)
-                cw = cw / cw.sum()
-                self.register_buffer("comp_w", cw)
-            rank_zero_info(f"Using component-wise MSE with weights: {self.comp_w.tolist()}")
 
-        self.set2set_loss = Set2SetLoss()  # uses MSE+Hungarian matching under the hood. :contentReference[oaicite:3]{index=3}
-
+        self.criterion = nn.MSELoss()
+        rank_zero_info("Using Mean Squared Error (MSE) loss.")
 
         # Wrap the model into a function usable by DPM_Solver
         def model_fn(x, timestep, cond, mask=None, global_data=None):
@@ -261,17 +158,7 @@ class CFMLightningModule(pl.LightningModule):
         # DPM solver for sampling
         self.dpm = DPM_Solver(model_fn=model_fn, noise_schedule=NoiseScheduleFlow())
 
-    def wasserstein_loss(self, v_pred, v_true):
-        """
-        Calculates the 1D Wasserstein distance component-wise.
-        This is equivalent to the L1 norm (Mean Absolute Error) between the
-        sorted predictions and targets over the batch dimension.
-        """
-        # Sort along the batch dimension (dim=0) for each feature
-        v_pred_sorted, _ = torch.sort(v_pred, dim=0)
-        v_true_sorted, _ = torch.sort(v_true, dim=0)
-        # Return the mean absolute error between the sorted tensors
-        return torch.mean(torch.abs(v_pred_sorted - v_true_sorted))
+
 
     def forward(self, x_t, cond, t):
         return self.model(x_t, cond, t)
@@ -291,15 +178,7 @@ class CFMLightningModule(pl.LightningModule):
         # Predict vector field
         v_pred = self(xt, cond, t)
 
-        # Loss
-        if self.hparams.loss_function == "component_mse":
-            per_dim = torch.mean((v_pred - ut) ** 2, dim=0)
-            comp_names = ["x0", "y0", "E", "theta", "phi"]
-            for i, name in enumerate(comp_names):
-                self.log(f"train/{name}_mse", per_dim[i].detach(), on_step=True, on_epoch=True, prog_bar=False, logger=True)
-            loss = torch.sum(per_dim * self.comp_w)
-        else:
-            loss = self.criterion(v_pred, ut)
+        loss = self.criterion(v_pred, ut)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -326,7 +205,6 @@ class CFMLightningModule(pl.LightningModule):
         else:
             loss = self.criterion(v_pred, ut)
 
-        # === Add: prediction sampling and set2set validation loss ===
         cond, x1 = batch                     # x1 is the true target (x0,y0,E,theta,phi) 5-D. :contentReference[oaicite:6]{index=6}
         x1 = x1.view(x1.size(0), -1).to(self.device)
 
@@ -361,21 +239,12 @@ class CFMLightningModule(pl.LightningModule):
             truth=cond,
             mask=None,
             global_data=None,
-            steps=25,
+            steps=50,
             method="multistep",
             skip_type="time_uniform_flow",
         )
         return samples
 
-    # === Add: helper to compute pred_loss with Set2SetLoss ===
-    @torch.no_grad()
-    def get_pred_loss(self, pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-        if pred.dim() == 2:
-            pred = pred.unsqueeze(1)
-        if true.dim() == 2:
-            true = true.unsqueeze(1)
-        out = self.set2set_loss(pred, true)   # no mask
-        return out["total_loss"].to(pred.device)
 
 
         # Build a mask of shape (B, N_pred, 2) where the second column is 1s,
@@ -383,7 +252,6 @@ class CFMLightningModule(pl.LightningModule):
         mask = torch.zeros((B, N_pred, 2), device=device, dtype=pred.dtype)
         mask[..., 1] = 1.0
 
-        out = self.set2set_loss(pred, true, mask)
         # out: dict with "total_loss", "pt_loss", "eta_loss", "phi_loss" fields. We use total_loss.
         return out["total_loss"].to(device)
 
@@ -417,7 +285,6 @@ class CFMLightningModule(pl.LightningModule):
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
-theta_max = np.pi * 65 / 180
 
 
 
@@ -432,8 +299,6 @@ class LossTracker(pl.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if 'val_loss' in trainer.logged_metrics:
             self.val_losses.append(trainer.logged_metrics['val_loss'].item())
-
-
 
 if __name__ == "__main__":
     # Check if this is the main process (rank 0) in a distributed setup.
@@ -450,8 +315,8 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="", help="Optional custom name for the output folder.")
 
 
-    parser.add_argument("--input_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_inputs.pt", help="Path to the training dataset (.pt file).")
-    parser.add_argument("--label_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_labels.pt", help="Path to the validation dataset (.pt file).")
+    parser.add_argument("--train_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/train.pt", help="Path to the training dataset (.pt file).")
+    parser.add_argument("--val_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/val.pt", help="Path to the validation dataset (.pt file).")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training.")
 
 
@@ -461,11 +326,12 @@ if __name__ == "__main__":
     parser.add_argument("--loss_function", type=str, default="mse", choices=["mse", "mseanddirection", "component_mse"], help="Loss function to use for training.")
     parser.add_argument("--time_pow", action="store_true",
                         help="Use power-law time sampling (t ~ Power(3)), inspired by fs_npf_lightning.")
+    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
+                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
     parser.add_argument("--use_scheduler", action="store_true", help="Enable the learning rate scheduler.")
     parser.add_argument("--gpus", type=str, default="0", help="Comma-separated list of GPU IDs to use (e.g., '0,1,2,3').")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train for.")
-    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
-                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
+
     parser.add_argument("--gradient_clip_val", type=float, default=0.0, help="Value for gradient clipping. 0 means no clipping.")
     parser.add_argument("--use_swa", action="store_true", help="Enable Stochastic Weight Averaging.")
 
@@ -491,7 +357,7 @@ if __name__ == "__main__":
     # --- Hyperparameters ---
     EPOCHS      = args.epochs
     LEARNING_RATE = 3e-5
-    NUM_RES_BLOCKS = 6
+    NUM_RES_BLOCKS = 4
 
     # --- Comet.ml Logger ---
     logger = None
@@ -513,13 +379,8 @@ if __name__ == "__main__":
             print("Please ensure COMET_API_KEY, COMET_PROJECT_NAME, and COMET_WORKSPACE env vars are set. Disabling logger.")
 
 
-
-                                 
-    data_module = SWGODataModule(
-        h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
-        batch_size=args.batch_size,
-        val_split=0.1,
-    )
+    data_module = SWGODataModule(train_data_path=args.train_data_path, val_data_path=args.val_data_path,
+                                 batch_size=args.batch_size)
 
     model_module = CFMLightningModule(
         learning_rate=LEARNING_RATE,
@@ -539,6 +400,7 @@ if __name__ == "__main__":
     callbacks = [
         TQDMProgressBar(refresh_rate=10),
         loss_tracker,
+        EarlyStopping(monitor="val_loss", mode="min", patience=25, verbose=is_main_process)
     ]
 
     if args.use_swa:
@@ -549,10 +411,11 @@ if __name__ == "__main__":
     if args.save_ckpt:
         # Note: 'train_loss_epoch' is available because self.log in training_step has on_epoch=True
         checkpoint_callback = ModelCheckpoint(
-            dirpath=os.path.join(output_dir, "ckpts"),
-            filename='{epoch:03d}',
-            save_top_k=-1,     # keep all checkpoints
-            every_n_epochs=1,  # save every epoch
+            dirpath=output_dir,
+            filename='{epoch:03d}-{val_loss:.4f}-{train_loss_epoch:.4f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=3,
             verbose=is_main_process
         )
         callbacks.append(checkpoint_callback)

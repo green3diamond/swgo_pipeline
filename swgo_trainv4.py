@@ -12,10 +12,10 @@ import os
 from datetime import datetime
 import argparse
 from lion_opt import Lion
-from torch.nn import MultiheadAttention
 
 
-from conditional_flow_matching import TargetConditionalFlowMatcher
+from conditional_flow_matching import TargetConditionalFlowMatcher, ReverseConditionalFlowMatcher
+from custom_scheduler import CosineAnnealingWarmupRestarts
 from modules import TimestepEmbedder, ResNetBlock
 
 from dpm import DPM_Solver, NoiseScheduleFlow
@@ -49,40 +49,27 @@ class CFMDiagramModel(nn.Module):
     data_dim: number of target features (x0, y0, E, theta, phi) -> 5
     cond_feature_dim: number of conditioned features (x, y, N, T) -> 4
     """
-    def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128,
-                 num_res_blocks=3, dropout=0.1, num_detectors=90):
+    def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128, num_res_blocks=3, dropout=0.1):
         super().__init__()
 
-        self.num_detectors = num_detectors
-        self.model_dim = model_dim
-
-        from modules import TimestepEmbedder, ResNetBlock
         self.time_embedder = TimestepEmbedder(model_dim)
 
-        def two_layer_mlp(in_dim, out_dim, p=0.1):
-            h1, h2 = 256, 256
+        def two_layer_mlp(in_dim, out_dim, hidden_dim=None, p=0.1):
+            h = hidden_dim or out_dim
             return nn.Sequential(
-                nn.Linear(in_dim, h1), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h1, h2), nn.SiLU(), nn.Dropout(p),
-                nn.Linear(h2, out_dim), nn.Dropout(p),
+                nn.Linear(in_dim, h),
+                nn.SiLU(),
+                nn.Dropout(p),
+                nn.Linear(h, out_dim),
+                nn.Dropout(p),
             )
 
         # Encoders
         self.cond_mlp         = two_layer_mlp(cond_feature_dim, model_dim, p=dropout)
         self.noisy_target_mlp = two_layer_mlp(data_dim,          model_dim, p=dropout)
 
-        # Conditioning signal 'C' (concat time + flattened cond)
-        cond_hidden_dim = model_dim
-        conditioning_input_dim = (num_detectors * cond_hidden_dim) + model_dim
-        self.conditioning_C = two_layer_mlp(conditioning_input_dim, model_dim, p=dropout)
-
-        # Cross-attention
-        self.cross_attn = MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True,
-        )
+        # Conditioning signal 'C' (concat time + pooled cond)
+        self.conditioning_C = two_layer_mlp(model_dim * 2, model_dim, p=dropout)
 
         # adaLN-zero
         self.adaLN_generator = nn.Linear(model_dim, model_dim * 2)
@@ -90,132 +77,129 @@ class CFMDiagramModel(nn.Module):
         nn.init.zeros_(self.adaLN_generator.weight)
         nn.init.zeros_(self.adaLN_generator.bias)
 
-        self.resnet_blocks = nn.ModuleList(
-            [ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)]
-        )
+        # Residual stack
+        self.resnet_blocks = nn.ModuleList([ResNetBlock(model_dim, dropout=dropout) for _ in range(num_res_blocks)])
 
+        # Final projection
         self.final_mlp = nn.Sequential(
-            nn.Linear(model_dim, model_dim * 4), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(model_dim * 4, model_dim), nn.Dropout(dropout),
+            nn.Linear(model_dim, model_dim * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.Dropout(dropout),
         )
         self.output_layer = nn.Linear(model_dim, data_dim)
+
 
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor, t: torch.Tensor):
         # Time embedding
         time_emb = self.time_embedder(t)
 
-        # Condition features
-        cond_emb = self.cond_mlp(cond)   # (B, M, D) if detectors present
+        # Condition features: support (B, 4) or (B, M, 4) for detector-level cond=(x,y,N,T)
+        cond_emb = self.cond_mlp(cond)
         if cond_emb.dim() == 3:
-            pooled_cond = cond_emb.reshape(cond_emb.size(0), -1)  # flatten detectors
+            # (B, M, H) -> pool across detectors
+            pooled_cond = cond_emb.mean(dim=1)
         elif cond_emb.dim() == 2:
+            # (B, H) -> already pooled / single detector vector
             pooled_cond = cond_emb
         else:
             raise ValueError(f"Unexpected cond_emb shape {cond_emb.shape}")
 
-        # === Global concatenation context ===
+        # Concatenate for context 'C'
         combined = torch.cat([time_emb, pooled_cond], dim=-1)
         c = self.conditioning_C(combined)
 
         # Noisy target features
         h = self.noisy_target_mlp(x_t)
 
-        # === Cross-attention ===
-        query = h.unsqueeze(1)  # (B, 1, D)
-        if cond_emb.dim() == 3:
-            key_value = cond_emb   # (B, M, D)
-        else:
-            key_value = c.unsqueeze(1)  # fallback
-
-        attn_output, _ = self.cross_attn(query, key_value, key_value)
-        h = h + attn_output.squeeze(1)  # residual connection
-
-        # === AdaLN conditioning ===
+        # adaLN-zero
         adaLN_params = self.adaLN_generator(c)
         scale, shift = adaLN_params.chunk(2, dim=-1)
         h = self.layer_norm(h) * (1 + scale) + shift
 
+        # Residual blocks
         for block in self.resnet_blocks:
             h = block(h)
 
+        # Final MLP
         h = self.final_mlp(h)
         v_pred = self.output_layer(h)
         return v_pred
 
-
-
 class SWGODataModule(pl.LightningDataModule):
     """
-    Loads directly from .h5, applies normalization, and builds datasets.
+    Loads data from separate inputs.pt and labels.pt files, normalizes the labels,
+    and splits the combined dataset into training, validation, and test sets.
     """
-    def __init__(self, h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
-                 batch_size=256, val_split=0.1, seed=42):
+    def __init__(self, inputs_path="/project/def-mdanning/hamza95/mini_inputs.pt", labels_path="/project/def-mdanning/hamza95/mini_labels.pt", batch_size=256, train_frac=0.8, val_frac=0.1):
         super().__init__()
-        self.h5_path = h5_path
+        self.inputs_path = inputs_path
+        self.labels_path = labels_path
         self.batch_size = batch_size
-        self.val_split = val_split
-        self.seed = seed
+        self.train_frac = train_frac
+        self.val_frac = val_frac
         self.num_workers = 10
 
-    def _zscore(self, data: np.ndarray, name: str):
-        mean = data.mean()
-        std = data.std()
-        if std == 0:
-            std = 0.1 if name in ["phi"] else 1.0
-        return (data - mean) / std
+        # Placeholders for normalization constants
+        self.labels_mean = None
+        self.labels_std = None
+
+    def prepare_data(self):
+        # This method is called once per node.
+        pass
 
     def setup(self, stage=None):
-        import h5py, numpy as np, torch
+        try:
+            rank_zero_info(f"Loading data from '{self.inputs_path}' and '{self.labels_path}'...")
+            inputs = torch.load(self.inputs_path)
+            labels = torch.load(self.labels_path)
 
-        # Load from .h5
-        with h5py.File(self.h5_path, "r") as f:
-            inputs = f["inputs"][:]   # (events, nunits, 4)
-            labels = f["labels"][:]   # (events, 5)
+            # --- Normalization ---
+            rank_zero_info("Normalizing labels...")
+            self.labels_mean = labels.mean(dim=0, keepdim=True)
+            self.labels_std = labels.std(dim=0, keepdim=True)
+            # Prevent division by zero for features with no variance
+            self.labels_std[self.labels_std == 0] = 1.0
+            normalized_labels = (labels - self.labels_mean) / self.labels_std
+            rank_zero_info(f"Labels Mean: {self.labels_mean.squeeze().tolist()}")
+            rank_zero_info(f"Labels Std:  {self.labels_std.squeeze().tolist()}")
 
-        # Normalize inputs
-        inputs_norm = np.zeros_like(inputs)
-        names_inputs = ["x", "y", "N", "T"]
-        for i, name in enumerate(names_inputs):
-            arr = inputs[:, :, i]
-            if name in ["E", "N"]:  # log-transform for E & N
-                arr = np.log(arr + 1e-8)
-            inputs_norm[:, :, i] = self._zscore(arr, name)
+            full_dataset = TensorDataset(inputs, normalized_labels)
+            
+            # --- Train/Val/Test Split ---
+            total_size = len(full_dataset)
+            val_size = int(self.val_frac * total_size)
+            test_frac = 1.0 - self.train_frac - self.val_frac
+            test_size = int(test_frac * total_size)
+            train_size = total_size - val_size - test_size
 
-        # Normalize labels
-        labels_norm = np.zeros_like(labels)
-        names_labels = ["x0", "y0", "E", "theta", "phi"]
-        for i, name in enumerate(names_labels):
-            arr = labels[:, i]
-            if name in ["E", "N"]:
-                arr = np.log(arr + 1e-8)
-            labels_norm[:, i] = self._zscore(arr, name)
+            if train_size <= 0 or val_size <= 0 or test_size <= 0:
+                raise ValueError(f"Calculated dataset split sizes are invalid. Check fractions. "
+                                 f"Train: {train_size}, Val: {val_size}, Test: {test_size}")
+            
+            rank_zero_info(f"Splitting data: {train_size} train, {val_size} validation, {test_size} test")
+            self.train_dataset, self.val_dataset, self.test_dataset = random_split(
+                full_dataset, 
+                [train_size, val_size, test_size],
+                generator=torch.Generator().manual_seed(42) # for reproducibility
+            )
 
-        # Convert to tensors
-        inputs_tensor = torch.tensor(inputs_norm, dtype=torch.float32)
-        labels_tensor = torch.tensor(labels_norm, dtype=torch.float32)
-
-        # Build dataset
-        full_dataset = TensorDataset(inputs_tensor, labels_tensor)
-        n_total = len(full_dataset)
-        n_val = int(self.val_split * n_total)
-        n_train = n_total - n_val 
-
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(self.seed)
-        )
-        rank_zero_info(f"Data loaded: {n_train} train, {n_val} val")
+        except FileNotFoundError as e:
+            rank_zero_info(f"Error: {e}. Please ensure data files exist.")
+            exit()
+        except Exception as e:
+            rank_zero_info(f"An error occurred during data setup: {e}")
+            exit()
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size,
-                          shuffle=True, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, pin_memory=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size * 2,
-                          num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size * 2, num_workers=self.num_workers, pin_memory=True)
 
-
-
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size * 2, num_workers=self.num_workers, pin_memory=True)
 
 class CFMLightningModule(pl.LightningModule):
     def __init__(self, learning_rate=3e-5, num_res_blocks=3, flow_matcher_type="target",
@@ -250,7 +234,7 @@ class CFMLightningModule(pl.LightningModule):
                 self.register_buffer("comp_w", cw)
             rank_zero_info(f"Using component-wise MSE with weights: {self.comp_w.tolist()}")
 
-        self.set2set_loss = Set2SetLoss()  # uses MSE+Hungarian matching under the hood. :contentReference[oaicite:3]{index=3}
+        self.set2set_loss = Set2SetLoss()
 
 
         # Wrap the model into a function usable by DPM_Solver
@@ -279,8 +263,8 @@ class CFMLightningModule(pl.LightningModule):
     def _common_step(self, batch, batch_idx):
         # batch = (cond, x1)
         cond, x1 = batch
-        x1 = x1.view(x1.size(0), -1)         # ensure (B, 5)
-        x0 = torch.randn_like(x1)            # prior
+        x1 = x1.view(x1.size(0), -1)
+        x0 = torch.randn_like(x1)
 
         # Sample time, noisy data xt, and the conditional vector field ut
         t_override = None
@@ -327,10 +311,9 @@ class CFMLightningModule(pl.LightningModule):
             loss = self.criterion(v_pred, ut)
 
         # === Add: prediction sampling and set2set validation loss ===
-        cond, x1 = batch                     # x1 is the true target (x0,y0,E,theta,phi) 5-D. :contentReference[oaicite:6]{index=6}
+        cond, x1 = batch
         x1 = x1.view(x1.size(0), -1).to(self.device)
 
-        # sample a predicted target using your existing DPM pipeline (same as predict_step)  :contentReference[oaicite:7]{index=7}
         x0 = torch.randn(cond.size(0), 5, device=self.device)
         pred = self.dpm.sample(
             x0,
@@ -340,7 +323,7 @@ class CFMLightningModule(pl.LightningModule):
             steps=50,
             method="multistep",
             skip_type="time_uniform_flow",
-            show_progress=False,   # <--- silences tqdm
+            show_progress=False,
 
         )
 
@@ -361,13 +344,12 @@ class CFMLightningModule(pl.LightningModule):
             truth=cond,
             mask=None,
             global_data=None,
-            steps=25,
+            steps=50,
             method="multistep",
             skip_type="time_uniform_flow",
         )
         return samples
 
-    # === Add: helper to compute pred_loss with Set2SetLoss ===
     @torch.no_grad()
     def get_pred_loss(self, pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
         if pred.dim() == 2:
@@ -376,16 +358,6 @@ class CFMLightningModule(pl.LightningModule):
             true = true.unsqueeze(1)
         out = self.set2set_loss(pred, true)   # no mask
         return out["total_loss"].to(pred.device)
-
-
-        # Build a mask of shape (B, N_pred, 2) where the second column is 1s,
-        # matching what Set2SetLoss.forward expects (it uses mask[..., 1]). :contentReference[oaicite:5]{index=5}
-        mask = torch.zeros((B, N_pred, 2), device=device, dtype=pred.dtype)
-        mask[..., 1] = 1.0
-
-        out = self.set2set_loss(pred, true, mask)
-        # out: dict with "total_loss", "pt_loss", "eta_loss", "phi_loss" fields. We use total_loss.
-        return out["total_loss"].to(device)
 
     def configure_optimizers(self):
         base_lr = float(self.hparams.learning_rate)
@@ -426,18 +398,13 @@ class LossTracker(pl.Callback):
         self.train_losses = []
         self.val_losses = []
     def on_train_epoch_end(self, trainer, pl_module):
-        # Access the logged metric which is aggregated over the epoch
         if 'train_loss_epoch' in trainer.logged_metrics:
             self.train_losses.append(trainer.logged_metrics['train_loss_epoch'].item())
     def on_validation_epoch_end(self, trainer, pl_module):
         if 'val_loss' in trainer.logged_metrics:
             self.val_losses.append(trainer.logged_metrics['val_loss'].item())
 
-
-
 if __name__ == "__main__":
-    # Check if this is the main process (rank 0) in a distributed setup.
-    # This is crucial for ensuring that file I/O and logging only happen once.
     is_main_process = os.environ.get("LOCAL_RANK", "0") == "0"
     
     if is_main_process:
@@ -449,9 +416,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_comet", action="store_true", help="Enable Comet.ml logging.")
     parser.add_argument("--run_name", type=str, default="", help="Optional custom name for the output folder.")
 
-
-    parser.add_argument("--input_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_inputs.pt", help="Path to the training dataset (.pt file).")
-    parser.add_argument("--label_data_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_labels.pt", help="Path to the validation dataset (.pt file).")
+    # --- UPDATED DATA PATH ARGUMENTS ---
+    parser.add_argument("--inputs_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_inputs.pt", help="Path to the input conditions dataset (.pt file).")
+    parser.add_argument("--labels_path", type=str, default="/n/home04/hhanif/swgo_input_files/mini_labels.pt", help="Path to the target labels dataset (.pt file).")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training.")
 
 
@@ -461,11 +428,12 @@ if __name__ == "__main__":
     parser.add_argument("--loss_function", type=str, default="mse", choices=["mse", "mseanddirection", "component_mse"], help="Loss function to use for training.")
     parser.add_argument("--time_pow", action="store_true",
                         help="Use power-law time sampling (t ~ Power(3)), inspired by fs_npf_lightning.")
+    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
+                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
     parser.add_argument("--use_scheduler", action="store_true", help="Enable the learning rate scheduler.")
     parser.add_argument("--gpus", type=str, default="0", help="Comma-separated list of GPU IDs to use (e.g., '0,1,2,3').")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train for.")
-    parser.add_argument("--component_weights", type=float, nargs=5, default=None,
-                        help="Optional 5 weights for component_mse over [x0, y0, E, theta, phi]; will be normalized.")
+
     parser.add_argument("--gradient_clip_val", type=float, default=0.0, help="Value for gradient clipping. 0 means no clipping.")
     parser.add_argument("--use_swa", action="store_true", help="Enable Stochastic Weight Averaging.")
 
@@ -476,7 +444,6 @@ if __name__ == "__main__":
     pl.seed_everything(42)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Create dynamic output directory
     base_script_name = os.path.splitext(os.path.basename(__file__))[0]
     if args.run_name:
         output_dir = f"{args.run_name}_{timestamp}"
@@ -491,7 +458,7 @@ if __name__ == "__main__":
     # --- Hyperparameters ---
     EPOCHS      = args.epochs
     LEARNING_RATE = 3e-5
-    NUM_RES_BLOCKS = 6
+    NUM_RES_BLOCKS = 4
 
     # --- Comet.ml Logger ---
     logger = None
@@ -512,14 +479,9 @@ if __name__ == "__main__":
             print(f"Error initializing CometLogger: {e}")
             print("Please ensure COMET_API_KEY, COMET_PROJECT_NAME, and COMET_WORKSPACE env vars are set. Disabling logger.")
 
-
-
-                                 
-    data_module = SWGODataModule(
-        h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
-        batch_size=args.batch_size,
-        val_split=0.1,
-    )
+    # --- UPDATED DATAMODULE INSTANTIATION ---
+    data_module = SWGODataModule(inputs_path=args.inputs_path, labels_path=args.labels_path,
+                                 batch_size=args.batch_size)
 
     model_module = CFMLightningModule(
         learning_rate=LEARNING_RATE,
@@ -535,10 +497,10 @@ if __name__ == "__main__":
 
     loss_tracker = LossTracker()
 
-    # Configure callbacks: progress bar, loss tracking, early stopping, and optional checkpointing
     callbacks = [
         TQDMProgressBar(refresh_rate=10),
         loss_tracker,
+        EarlyStopping(monitor="val_loss", mode="min", patience=25, verbose=is_main_process)
     ]
 
     if args.use_swa:
@@ -547,12 +509,12 @@ if __name__ == "__main__":
             print("INFO: Stochastic Weight Averaging (SWA) is enabled.")
 
     if args.save_ckpt:
-        # Note: 'train_loss_epoch' is available because self.log in training_step has on_epoch=True
         checkpoint_callback = ModelCheckpoint(
-            dirpath=os.path.join(output_dir, "ckpts"),
-            filename='{epoch:03d}',
-            save_top_k=-1,     # keep all checkpoints
-            every_n_epochs=1,  # save every epoch
+            dirpath=output_dir,
+            filename='{epoch:03d}-{val_loss:.4f}-{train_loss_epoch:.4f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=3,
             verbose=is_main_process
         )
         callbacks.append(checkpoint_callback)
@@ -562,7 +524,6 @@ if __name__ == "__main__":
         if is_main_process:
             print("INFO: Model checkpointing is disabled. Use --save_ckpt to enable.")
 
-    # Configure trainer for CPU, single GPU, or multi-GPU
     accelerator = "cpu"
     devices = 1
     strategy = "auto"
@@ -606,10 +567,93 @@ if __name__ == "__main__":
     # --- Training ---
     if is_main_process:
         print("\nStarting training with PyTorch Lightning...")
-    trainer.fit(model_module, data_module)
+    trainer.fit(model_module, datamodule=data_module)
     if is_main_process:
         print("Training finished.")
 
+    # --- NEW: Prediction and Plotting Section ---
+    if is_main_process:
+        print("\nStarting prediction and plotting on a test batch...")
+        
+        # Ensure the model is in eval mode and on the correct device
+        model_module.eval()
+        model_module.to(device)
+
+        # Get a single batch from the test dataloader
+        test_loader = data_module.test_dataloader()
+        try:
+            cond_batch, labels_batch_norm = next(iter(test_loader))
+        except StopIteration:
+            print("Test dataloader is empty. Skipping prediction.")
+            exit()
+
+        cond_batch = cond_batch.to(device)
+        
+        # Generate predictions
+        with torch.no_grad():
+            pred_batch_norm = model_module.predict_step((cond_batch, None), 0)
+
+        # Move tensors to CPU for plotting
+        labels_batch_norm = labels_batch_norm.cpu()
+        pred_batch_norm = pred_batch_norm.cpu()
+
+        # Inverse transform to get original scale
+        labels_mean = data_module.labels_mean.cpu()
+        labels_std = data_module.labels_std.cpu()
+        
+        labels_true = labels_batch_norm * labels_std + labels_mean
+        predictions = pred_batch_norm * labels_std + labels_mean
+        
+        print(f"Plotting results for a batch of size {labels_true.shape[0]}")
+        
+        feature_names = ['x0', 'y0', 'E', 'theta', 'phi']
+
+        # Plot 1: True vs. Prediction
+        fig1, axes1 = plt.subplots(1, 5, figsize=(28, 5))
+        fig1.suptitle('True vs. Predicted Values', fontsize=16)
+        
+        for i, name in enumerate(feature_names):
+            true_vals = labels_true[:, i]
+            pred_vals = predictions[:, i]
+            
+            min_val = min(true_vals.min(), pred_vals.min())
+            max_val = max(true_vals.max(), pred_vals.max())
+            
+            axes1[i].scatter(true_vals, pred_vals, alpha=0.3, s=10)
+            axes1[i].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='y=x')
+            axes1[i].set_xlabel(f'True {name}')
+            axes1[i].set_ylabel(f'Predicted {name}')
+            axes1[i].set_title(name)
+            axes1[i].grid(True)
+            axes1[i].legend()
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot1_path = os.path.join(output_dir, "true_vs_prediction.png")
+        plt.savefig(plot1_path)
+        print(f"Saved true vs. prediction plot to {plot1_path}")
+        plt.close(fig1)
+
+        # Plot 2: 1D Distributions
+        fig2, axes2 = plt.subplots(1, 5, figsize=(28, 5))
+        fig2.suptitle('1D Distributions of True and Predicted Values', fontsize=16)
+        
+        for i, name in enumerate(feature_names):
+            true_vals = labels_true[:, i]
+            pred_vals = predictions[:, i]
+
+            axes2[i].hist(true_vals.numpy(), bins=50, density=True, histtype='step', linewidth=2, label='True')
+            axes2[i].hist(pred_vals.numpy(), bins=50, density=True, histtype='step', linewidth=2, label='Predicted')
+            axes2[i].set_xlabel(name)
+            axes2[i].set_ylabel('Density')
+            axes2[i].set_title(name)
+            axes2[i].legend()
+            axes2[i].grid(True)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot2_path = os.path.join(output_dir, "distributions_comparison.png")
+        plt.savefig(plot2_path)
+        print(f"Saved distributions plot to {plot2_path}")
+        plt.close(fig2)
 
     if is_main_process:
         print("Job finished.")

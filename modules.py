@@ -403,6 +403,23 @@ class SwiGLU(nn.Module):
         return self.w1(x) * torch.nn.functional.silu(self.w2(x))
 
 
+
+class MSEAndDirectionLoss(torch.nn.Module):
+    """
+    Figure 7 - https://arxiv.org/abs/2410.10356
+    """
+
+    def __init__(self, cosine_sim_dim: int = 1):  # fix default to 1
+        super().__init__()
+        self.cosine_sim_dim = cosine_sim_dim
+
+    def forward(self, pred, target, **kwargs):
+        mse_loss = torch.nn.functional.mse_loss(pred, target, reduction="sum")
+        direction_loss = (
+            1.0 - torch.nn.functional.cosine_similarity(pred, target, dim=self.cosine_sim_dim)
+        ).sum()
+        return mse_loss + direction_loss
+
 class SelfAttentionBlock(nn.Module):
     """
     Lightweight Transformer-style block:
@@ -435,3 +452,34 @@ class SelfAttentionBlock(nn.Module):
         y = self.ffn(y)
         x = x + self.drop2(y)
         return x
+
+# ==============================
+#   Normalization Utils
+# ==============================
+class StdNormalizer:
+    def __init__(self, name=""):
+        self.name = name
+        self.mean = None
+        self.std = None
+
+    def calculate(self, x: torch.Tensor):
+        mean = x.mean()
+        if x.numel() < 2:
+            std = torch.tensor(0.1).float() if self.name in ["eta", "phi"] else torch.tensor(1.0).float()
+        else:
+            std = x.std()
+            if std == 0:
+                std = torch.tensor(0.1).float() if self.name in ["eta", "phi"] else torch.tensor(1.0).float()
+        self.mean = mean
+        self.std = std
+        return mean, std
+
+    def forward(self, x: torch.Tensor):
+        if self.mean is None or self.std is None:
+            self.calculate(x)
+        return (x - self.mean) / self.std
+
+    def inverse(self, x: torch.Tensor):
+        if self.mean is None or self.std is None:
+            raise RuntimeError("StdNormalizer not fitted yet.")
+        return x * self.std + self.mean
