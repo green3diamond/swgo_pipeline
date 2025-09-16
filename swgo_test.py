@@ -8,7 +8,7 @@ from swgo_trainv2 import CFMLightningModule
 import matplotlib.pyplot as plt
 
 # --- Configuration ---
-CKPT_PATH = "/n/home04/hhanif/test15sept/swgo_trainv2_run_results_20250915_045024/ckpts/epoch=319.ckpt"
+CKPT_PATH = "/swgo_trainv2_run_results_20250916_122851/ckpts/epoch=299.ckpt"
 BATCH_SIZE = 512
 
 
@@ -163,7 +163,10 @@ def main():
     os.makedirs(COMP_DIR, exist_ok=True)
 
     # 1. Load test dataset via DataModule
-    dm = SWGODataModule(batch_size=BATCH_SIZE)
+    dm = SWGODataModule(
+        test_h5_path="/content/drive/MyDrive/Colab Notebooks/SWGO/test.h5",      
+        batch_size=BATCH_SIZE
+      )
     dm.setup()
     test_loader = dm.test_dataloader()
     print(f"Loaded {len(dm.test_dataset)} test samples.")
