@@ -13,7 +13,7 @@ from datetime import datetime
 import argparse
 from lion_opt import Lion
 from torch.nn import MultiheadAttention
-
+import os
 
 from conditional_flow_matching import TargetConditionalFlowMatcher
 from modules import TimestepEmbedder, ResNetBlock
@@ -511,12 +511,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error initializing CometLogger: {e}")
             print("Please ensure COMET_API_KEY, COMET_PROJECT_NAME, and COMET_WORKSPACE env vars are set. Disabling logger.")
-
-
-
-                                 
+    
+                             
     data_module = SWGODataModule(
-        h5_path="/n/home04/hhanif/swgo_input_files/mini_dataset.h5",
+        h5_path="/content/drive/MyDrive/Colab Notebooks/SWGO/dataset.h5",
         batch_size=args.batch_size,
         val_split=0.1,
     )
