@@ -428,6 +428,7 @@ if __name__ == "__main__":
     # This is crucial for ensuring that file I/O and logging only happen once.
     is_main_process = os.environ.get("LOCAL_RANK", "0") == "0"
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_main_process:
         print(f"PyTorch using device: {device}")
 
