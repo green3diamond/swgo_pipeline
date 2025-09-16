@@ -23,8 +23,6 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 from set2setloss import Set2SetLoss
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 class MSEAndDirectionLoss(torch.nn.Module):
     """
@@ -331,7 +329,7 @@ class CFMLightningModule(pl.LightningModule):
         x1 = x1.view(x1.size(0), -1).to(self.device)
 
         # sample a predicted target using your existing DPM pipeline (same as predict_step)  :contentReference[oaicite:7]{index=7}
-        x0 = torch.randn(cond.size(0), 5, device=self.device)
+        x0 = torch.randn(cond.size(0), 5, device=cond.device)
         pred = self.dpm.sample(
             x0,
             truth=cond,
@@ -355,7 +353,7 @@ class CFMLightningModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         cond, _ = batch  # We only need the condition from the batch
-        x0 = torch.randn(cond.size(0), 5, device=self.device)
+        x0 = torch.randn(cond.size(0), 5, device=cond.device)
         samples = self.dpm.sample(
             x0,
             truth=cond,
@@ -376,16 +374,6 @@ class CFMLightningModule(pl.LightningModule):
             true = true.unsqueeze(1)
         out = self.set2set_loss(pred, true)   # no mask
         return out["total_loss"].to(pred.device)
-
-
-        # Build a mask of shape (B, N_pred, 2) where the second column is 1s,
-        # matching what Set2SetLoss.forward expects (it uses mask[..., 1]). :contentReference[oaicite:5]{index=5}
-        mask = torch.zeros((B, N_pred, 2), device=device, dtype=pred.dtype)
-        mask[..., 1] = 1.0
-
-        out = self.set2set_loss(pred, true, mask)
-        # out: dict with "total_loss", "pt_loss", "eta_loss", "phi_loss" fields. We use total_loss.
-        return out["total_loss"].to(device)
 
     def configure_optimizers(self):
         base_lr = float(self.hparams.learning_rate)
