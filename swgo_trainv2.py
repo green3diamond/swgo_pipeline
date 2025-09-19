@@ -26,7 +26,15 @@ from set2setloss import Set2SetLoss
 
 class MSEAndDirectionLoss(torch.nn.Module):
     """
-    Figure 7 - https://arxiv.org/abs/2410.10356
+    Combined MSE and cosine similarity direction loss for Diffusion Transformers.
+    
+    Combines L_mse + L_direction where L_direction = sum(1 - cosine_similarity).
+    
+    Args:
+        cosine_sim_dim (int, optional): Dimension for cosine similarity. Defaults to 1.
+    
+    Reference:
+        Figure 7 - https://arxiv.org/abs/2410.10356
     """
 
     def __init__(self, cosine_sim_dim: int = 1):  # fix default to 1
@@ -34,6 +42,7 @@ class MSEAndDirectionLoss(torch.nn.Module):
         self.cosine_sim_dim = cosine_sim_dim
 
     def forward(self, pred, target, **kwargs):
+        """Compute combined MSE and direction loss."""
         mse_loss = torch.nn.functional.mse_loss(pred, target, reduction="sum")
         direction_loss = (
             1.0 - torch.nn.functional.cosine_similarity(pred, target, dim=self.cosine_sim_dim)
