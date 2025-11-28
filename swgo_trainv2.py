@@ -53,8 +53,36 @@ class MSEAndDirectionLoss(torch.nn.Module):
 
 class CFMDiagramModel(nn.Module):
     """
-    data_dim: number of target features (x0, y0, E, theta, phi) -> 5
-    cond_feature_dim: number of conditioned features (x, y, N, T) -> 4
+    CFMDiagramModel is a conditional diffusion model designed for processing and generating target features
+    based on conditioned detector features and time steps. The model architecture incorporates MLP encoders,
+    cross-attention, adaptive layer normalization (AdaLN), and residual blocks to effectively combine and
+    process noisy target data with conditioning signals.
+
+    Args:
+        data_dim (int): number of target features (x0, y0, E, theta, phi) -> 5
+        cond_feature_dim (int): number of conditioned features (x, y, N, T) -> 4
+        model_dim (int): Dimensionality of internal model representations (default: 128).
+        num_res_blocks (int): Number of residual blocks in the model (default: 3).
+        dropout (float): Dropout probability used throughout the model (default: 0.1).
+        num_detectors (int): Number of detector elements in the conditioning input (default: 90).
+
+    Attributes:
+        num_detectors (int): Number of detector elements.
+        model_dim (int): Internal model dimensionality.
+        time_embedder (nn.Module): Module for embedding time steps.
+        cond_mlp (nn.Module): MLP encoder for conditioning features.
+        noisy_target_mlp (nn.Module): MLP encoder for noisy target features.
+        conditioning_C (nn.Module): MLP for combining time and conditioning signals.
+        cross_attn (nn.Module): Multi-head cross-attention layer.
+        adaLN_generator (nn.Module): Linear layer generating AdaLN scale and shift parameters.
+        layer_norm (nn.Module): Layer normalization module.
+        resnet_blocks (nn.ModuleList): List of residual blocks.
+        final_mlp (nn.Module): Final MLP before output.
+        output_layer (nn.Module): Linear output layer for target prediction.
+
+    Forward 
+    Returns:
+        torch.Tensor: Predicted target features of shape (B, data_dim).
     """
     def __init__(self, data_dim=5, cond_feature_dim=4, model_dim=128,
                  num_res_blocks=3, dropout=0.1, num_detectors=90):
@@ -108,6 +136,14 @@ class CFMDiagramModel(nn.Module):
         self.output_layer = nn.Linear(model_dim, data_dim)
 
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor, t: torch.Tensor):
+        """
+        Forward pass of the CFMDiagramModel.
+        
+        Args:
+            x_t (torch.Tensor): Noisy target features of shape (B, data_dim).
+            cond (torch.Tensor): Conditioning features of shape (B, M, cond_feature_dim) or (B, cond_feature_dim).
+            t (torch.Tensor): Time step tensor of shape (B,).
+        """
         # Time embedding
         time_emb = self.time_embedder(t)
 
